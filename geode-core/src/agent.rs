@@ -228,66 +228,82 @@ impl Agent {
 
             let response = self.llm.chat(request).await?;
 
-            let mut has_tool_calls = false;
-            let mut text_only = false;
+            // Snapshot the choice so we can use it after the loop iteration.
+            // The response.choices is consumed in the match below, so we
+            // extract what we need up front.
+            let choice = response.choices.first().cloned();
+            let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
+            let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
 
-            if let Some(choice) = response.choices.first() {
-                if let Some(tc_list) = &choice.message.tool_calls {
-                    if tc_list.is_empty() {
-                        text_only = true;
-                    } else {
-                        for tc in tc_list {
-                            has_tool_calls = true;
-                            let tool_call = ToolCall {
-                                id: tc.id.clone(),
-                                call_type: tc.call_type.clone(),
-                                function: ToolFunction {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
-                                },
-                            };
+            if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
+                // Build assistant message with tool calls
+                let assistant_tool_calls: Vec<ToolCall> = tc_list
+                    .iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        call_type: tc.call_type.clone(),
+                        function: ToolFunction {
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        },
+                    })
+                    .collect();
 
-                            events.push(AgentEvent::ToolCallAboutToRun {
-                                name: tc.function.name.clone(),
-                                args: tc.function.arguments.clone(),
-                            });
+                // Add assistant message with tool calls to messages and context
+                let assistant_content = text_content.as_deref().unwrap_or("").to_string();
+                messages.push(Message::assistant(
+                    assistant_content.clone(),
+                    Some(assistant_tool_calls.clone()),
+                ));
+                self.context.add_message(Message::assistant(
+                    assistant_content,
+                    Some(assistant_tool_calls),
+                ));
 
-                            let tool_result = self.execute_tool_call(&tool_call).await;
-                            events.push(AgentEvent::ToolCallComplete {
-                                name: tool_call.function.name.clone(),
-                                output: tool_result.output.clone(),
-                                success: tool_result.success,
-                            });
+                // Execute each tool call and add results
+                for tc in tc_list {
+                    let tool_call = ToolCall {
+                        id: tc.id.clone(),
+                        call_type: tc.call_type.clone(),
+                        function: ToolFunction {
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        },
+                    };
 
-                            if tool_result.output.contains("was denied by user") {
-                                return Ok(Some((tc.function.name.clone(), tc.function.arguments.clone())));
-                            }
+                    events.push(AgentEvent::ToolCallAboutToRun {
+                        name: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
+                    });
 
-                            self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
-                        }
+                    let tool_result = self.execute_tool_call(&tool_call).await;
+                    events.push(AgentEvent::ToolCallComplete {
+                        name: tool_call.function.name.clone(),
+                        output: tool_result.output.clone(),
+                        success: tool_result.success,
+                    });
+
+                    if tool_result.output.contains("was denied by user") {
+                        return Ok(Some((tc.function.name.clone(), tc.function.arguments.clone())));
                     }
-                }
-            }
 
-            if has_tool_calls {
+                    // Add tool result to both messages and context
+                    let result_msg = Message::tool_result(&tc.id, &tool_result.output);
+                    messages.push(result_msg.clone());
+                    self.context.add_message(result_msg);
+                }
+
                 continue; // keep looping — LLM may have more tool calls
             }
 
-            if text_only {
-                // LLM returned text without tool calls — add it and ask it to continue
-                if let Some(choice) = response.choices.first() {
-                    if let Some(text) = &choice.message.content {
-                        if !text.trim().is_empty() {
-                            messages.push(Message::assistant(text.clone(), None));
-                            self.context.add_message(Message::assistant(text.clone(), None));
-                            events.push(AgentEvent::TextChunk(text.clone()));
-                        }
-                    }
-                }
-                continue; // loop back — ask the LLM to actually act
+            // No tool calls — LLM returned text only
+            if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
+                messages.push(Message::assistant(text.clone(), None));
+                self.context.add_message(Message::assistant(text.clone(), None));
+                events.push(AgentEvent::TextChunk(text.clone()));
+                continue; // loop back — ask the LLM to continue
             }
 
-            // Shouldn't reach here, but break to avoid infinite loop
             break;
         }
 
@@ -357,62 +373,67 @@ impl Agent {
 
             let response = self.llm.chat(request).await?;
 
-            let mut has_tool_calls = false;
-            let mut text_only = false;
+            let choice = response.choices.first().cloned();
+            let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
+            let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
 
-            if let Some(choice) = response.choices.first() {
-                if let Some(tc_list) = &choice.message.tool_calls {
-                    if tc_list.is_empty() {
-                        text_only = true;
-                    } else {
-                        for tc in tc_list {
-                            has_tool_calls = true;
-                            let tool_call = ToolCall {
-                                id: tc.id.clone(),
-                                call_type: tc.call_type.clone(),
-                                function: ToolFunction {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
-                                },
-                            };
-
-                            let tool_result = self.execute_tool_call(&tool_call).await;
-                            self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
-                        }
-                    }
-                }
-
-                if let Some(text) = &choice.message.content {
-                    if !text.trim().is_empty() {
-                        accumulated_text = text.clone();
-                    }
-                }
+            if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
+                accumulated_text = text.clone();
             }
 
-            if has_tool_calls {
-                messages.push(Message::assistant(String::new(), None));
+            if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
+                last_had_tool_calls = true;
+
+                let assistant_tool_calls: Vec<ToolCall> = tc_list
+                    .iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        call_type: tc.call_type.clone(),
+                        function: ToolFunction {
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        },
+                    })
+                    .collect();
+
+                let assistant_content = text_content.unwrap_or_default();
+                messages.push(Message::assistant(
+                    assistant_content.clone(),
+                    Some(assistant_tool_calls.clone()),
+                ));
+                self.context.add_message(Message::assistant(
+                    assistant_content,
+                    Some(assistant_tool_calls),
+                ));
+
+                for tc in tc_list {
+                    let tool_call = ToolCall {
+                        id: tc.id.clone(),
+                        call_type: tc.call_type.clone(),
+                        function: ToolFunction {
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        },
+                    };
+                    let tool_result = self.execute_tool_call(&tool_call).await;
+                    let result_msg = Message::tool_result(&tc.id, &tool_result.output);
+                    messages.push(result_msg.clone());
+                    self.context.add_message(result_msg);
+                }
                 continue;
             }
 
-            if text_only {
-                // LLM returned text without tool calls — check if it suggests more actions
-                if !accumulated_text.is_empty() {
-                    messages.push(Message::assistant(accumulated_text.clone(), None));
-                    // If we had tool calls in the previous iteration and now get text,
-                    // it might be a final answer. But check one more time.
-                    if last_had_tool_calls {
-                        // One more pass to see if the LLM wants to do more
-                        last_had_tool_calls = false;
-                        continue;
-                    }
-                    // No tool calls and text only — this is the final answer
-                    return Ok(accumulated_text);
+            // No tool calls — text only
+            if !accumulated_text.is_empty() {
+                messages.push(Message::assistant(accumulated_text.clone(), None));
+                if last_had_tool_calls {
+                    last_had_tool_calls = false;
+                    continue;
                 }
-                last_had_tool_calls = false;
-                continue;
+                return Ok(accumulated_text);
             }
 
-            break;
+            last_had_tool_calls = false;
         }
 
         Ok(accumulated_text)
@@ -430,7 +451,7 @@ impl Agent {
 
         let request = ChatRequest {
             model: self.model_name.clone(),
-            messages,
+            messages: messages.clone(),
             tools: Some(self.registry.to_function_definitions()),
             tool_choice: Some("auto".to_string()),
         };
@@ -443,8 +464,114 @@ impl Agent {
             }
         };
 
-        if let Some(choice) = response.choices.first() {
-            if let Some(tc_list) = &choice.message.tool_calls {
+        // Process initial response — add assistant + tool results to messages
+        let choice = response.choices.first().cloned();
+        let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
+        let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
+
+        if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
+            events.push(AgentEvent::TextChunk(text.clone()));
+        }
+
+        if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
+            let assistant_tool_calls: Vec<ToolCall> = tc_list
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    call_type: tc.call_type.clone(),
+                    function: ToolFunction {
+                        name: tc.function.name.clone(),
+                        arguments: tc.function.arguments.clone(),
+                    },
+                })
+                .collect();
+
+            messages.push(Message::assistant(
+                text_content.unwrap_or_default(),
+                Some(assistant_tool_calls.clone()),
+            ));
+            self.context.add_message(Message::assistant(
+                String::new(),
+                Some(assistant_tool_calls),
+            ));
+
+            for tc in tc_list {
+                events.push(AgentEvent::ToolCallAboutToRun {
+                    name: tc.function.name.clone(),
+                    args: tc.function.arguments.clone(),
+                });
+                let tool_call = ToolCall {
+                    id: tc.id.clone(),
+                    call_type: tc.call_type.clone(),
+                    function: ToolFunction {
+                        name: tc.function.name.clone(),
+                        arguments: tc.function.arguments.clone(),
+                    },
+                };
+                let tool_result = self.execute_tool_call(&tool_call).await;
+                events.push(AgentEvent::ToolCallComplete {
+                    name: tool_call.function.name.clone(),
+                    output: tool_result.output.clone(),
+                    success: tool_result.success,
+                });
+                let result_msg = Message::tool_result(&tc.id, &tool_result.output);
+                messages.push(result_msg.clone());
+                self.context.add_message(result_msg);
+            }
+        }
+
+        // Final answer loop with tools enabled
+        let mut final_messages = messages.clone();
+        final_messages.insert(0, Message::system(self.system_prompt.clone()));
+
+        let mut accumulated_text = String::new();
+        let mut last_had_tool_calls = false;
+
+        for _ in 0..10 {
+            let request = ChatRequest {
+                model: self.model_name.clone(),
+                messages: final_messages.clone(),
+                tools: Some(self.registry.to_function_definitions()),
+                tool_choice: Some("auto".to_string()),
+            };
+
+            let response = match self.llm.chat(request).await {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            let choice = response.choices.first().cloned();
+            let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
+            let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
+
+            if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
+                accumulated_text = text.clone();
+            }
+
+            if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
+                last_had_tool_calls = true;
+
+                let assistant_tool_calls: Vec<ToolCall> = tc_list
+                    .iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        call_type: tc.call_type.clone(),
+                        function: ToolFunction {
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        },
+                    })
+                    .collect();
+
+                final_messages.push(Message::assistant(
+                    text_content.unwrap_or_default(),
+                    Some(assistant_tool_calls.clone()),
+                ));
+                self.context.add_message(Message::assistant(
+                    String::new(),
+                    Some(assistant_tool_calls),
+                ));
+
                 for tc in tc_list {
                     events.push(AgentEvent::ToolCallAboutToRun {
                         name: tc.function.name.clone(),
@@ -464,87 +591,15 @@ impl Agent {
                         output: tool_result.output.clone(),
                         success: tool_result.success,
                     });
-                    self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
+                    let result_msg = Message::tool_result(&tc.id, &tool_result.output);
+                    final_messages.push(result_msg.clone());
+                    self.context.add_message(result_msg);
                 }
-            }
-            if let Some(text) = &choice.message.content {
-                if !text.is_empty() {
-                    events.push(AgentEvent::TextChunk(text.clone()));
-                }
-            }
-        }
-
-        // Get final answer after executing any tool calls, checking for more actions
-        let mut final_messages = self
-            .context
-            .get_completion_messages()
-            .into_iter()
-            .filter_map(|m| m.to_api_message())
-            .collect::<Vec<_>>();
-        final_messages.insert(0, Message::system(self.system_prompt.clone()));
-
-        let mut accumulated_text = String::new();
-        let mut last_had_tool_calls = false;
-
-        for _ in 0..10 {
-            let request = ChatRequest {
-                model: self.model_name.clone(),
-                messages: final_messages.clone(),
-                tools: Some(self.registry.to_function_definitions()),
-                tool_choice: Some("auto".to_string()),
-            };
-
-            let response = match self.llm.chat(request).await {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-
-            let mut has_tool_calls = false;
-            let mut text_only = false;
-
-            if let Some(choice) = response.choices.first() {
-                if let Some(tc_list) = &choice.message.tool_calls {
-                    if tc_list.is_empty() {
-                        text_only = true;
-                    } else {
-                        for tc in tc_list {
-                            has_tool_calls = true;
-                            events.push(AgentEvent::ToolCallAboutToRun {
-                                name: tc.function.name.clone(),
-                                args: tc.function.arguments.clone(),
-                            });
-                            let tool_call = ToolCall {
-                                id: tc.id.clone(),
-                                call_type: tc.call_type.clone(),
-                                function: ToolFunction {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
-                                },
-                            };
-                            let tool_result = self.execute_tool_call(&tool_call).await;
-                            events.push(AgentEvent::ToolCallComplete {
-                                name: tool_call.function.name.clone(),
-                                output: tool_result.output.clone(),
-                                success: tool_result.success,
-                            });
-                            self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
-                        }
-                    }
-                }
-
-                if let Some(text) = &choice.message.content {
-                    if !text.trim().is_empty() {
-                        accumulated_text = text.clone();
-                    }
-                }
-            }
-
-            if has_tool_calls {
-                final_messages.push(Message::assistant(String::new(), None));
                 continue;
             }
 
-            if text_only && !accumulated_text.is_empty() {
+            // No tool calls — text only
+            if !accumulated_text.is_empty() {
                 final_messages.push(Message::assistant(accumulated_text.clone(), None));
                 if last_had_tool_calls {
                     last_had_tool_calls = false;
