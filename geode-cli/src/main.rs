@@ -78,7 +78,7 @@ async fn main() {
 
         let llm = LlmClient::new(&server_url);
         let system_prompt = repl::build_system_prompt(&registry);
-        let mut agent = Agent::new(llm, registry, system_prompt, None, &model_name);
+        let mut agent = Agent::new(llm, registry, system_prompt, None::<fn(&str, &str) -> bool>, &model_name);
 
         let result = agent.run(prompt).await;
         for event in result {

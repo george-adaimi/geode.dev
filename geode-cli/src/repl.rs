@@ -1,6 +1,6 @@
 use geode_core::{Agent, LlmClient, ToolRegistry};
 use geode_tools::{FsTool, ShellTool, WebTool};
-use std::io::{self, Write};
+use std::io::Write;
 
 pub struct Repl {
     agent: Agent,
@@ -59,14 +59,14 @@ impl Repl {
                                 println!("\n{}", plan.format_display());
                             }
                             geode_core::AgentEvent::ToolCallAboutToRun { name, args } => {
-                                println!("\n[Calling: {}({})]", name, truncate(args, 100));
+                                println!("\n[Calling: {}({})]", name, truncate(&args, 100));
                             }
                             geode_core::AgentEvent::ToolCallComplete { name, output, success } => {
                                 let status = if *success { "OK" } else { "FAIL" };
                                 println!("[{}] {} → {}", status, name, truncate(output, 200));
                             }
                             geode_core::AgentEvent::ApprovalDenied { name, args } => {
-                                println!("\n[Denied: {}({})]", name, truncate(args, 100));
+                                println!("\n[Denied: {}({})]", name, truncate(&args, 100));
                                 denied = true;
                             }
                             geode_core::AgentEvent::Complete(answer) => {
@@ -95,14 +95,14 @@ impl Repl {
                                         println!("\n{}", plan.format_display());
                                     }
                                     geode_core::AgentEvent::ToolCallAboutToRun { name, args } => {
-                                        println!("\n[Calling: {}({})]", name, truncate(args, 100));
+                                        println!("\n[Calling: {}({})]", name, truncate(&args, 100));
                                     }
                                     geode_core::AgentEvent::ToolCallComplete { name, output, success } => {
                                         let status = if success { "OK" } else { "FAIL" };
                                         println!("[{}] {} → {}", status, name, truncate(&output, 200));
                                     }
                                     geode_core::AgentEvent::ApprovalDenied { name, args } => {
-                                        println!("\n[Denied: {}({})]", name, truncate(args, 100));
+                                        println!("\n[Denied: {}({})]", name, truncate(&args, 100));
                                     }
                                     geode_core::AgentEvent::Complete(answer) => {
                                         println!("\n{}", answer);
@@ -122,8 +122,9 @@ impl Repl {
     }
 }
 
-fn approval_callback(_tool_name: &str, _args: &str) -> bool {
-    print!("\n[Approval required] Execute this tool call? (yes/no) > ");
+fn approval_callback(tool_name: &str, args: &str) -> bool {
+    let display = truncate_middle(args, 120);
+    print!("\n[Approval required] Execute `{tool_name}({display})`? (yes/no) > ");
     std::io::stdout().flush().unwrap();
 
     let mut input = String::new();
@@ -132,6 +133,15 @@ fn approval_callback(_tool_name: &str, _args: &str) -> bool {
     }
 
     matches!(input.trim(), "y" | "yes" | "Y" | "YES")
+}
+
+fn truncate_middle(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let half = max_len / 2;
+        format!("{}...{}", &s[..half], &s[s.len() - half..])
+    }
 }
 
 pub fn load_system_prompt() -> String {

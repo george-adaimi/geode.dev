@@ -215,57 +215,83 @@ impl Agent {
 
         let mut messages = vec![Message::system(self.system_prompt.clone())];
         messages.push(Message::user(prompt));
-        let request = ChatRequest {
-            model: self.model_name.clone(),
-            messages,
-            tools: Some(self.registry.to_function_definitions()),
-            tool_choice: Some("auto".to_string()),
-        };
 
-        let response = self.llm.chat(request).await?;
-        let mut has_tool_calls = false;
+        // Loop: if the LLM returns text without tool calls, ask it to continue
+        // with actual tool executions rather than just describing what it would do.
+        for _loop_iter in 0..10 {
+            let request = ChatRequest {
+                model: self.model_name.clone(),
+                messages: messages.clone(),
+                tools: Some(self.registry.to_function_definitions()),
+                tool_choice: Some("auto".to_string()),
+            };
 
-        if let Some(choice) = response.choices.first() {
-            if let Some(tc_list) = &choice.message.tool_calls {
-                for tc in tc_list {
-                    has_tool_calls = true;
-                    let tool_call = ToolCall {
-                        id: tc.id.clone(),
-                        call_type: tc.call_type.clone(),
-                        function: ToolFunction {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                    };
+            let response = self.llm.chat(request).await?;
 
-                    events.push(AgentEvent::ToolCallAboutToRun {
-                        name: tc.function.name.clone(),
-                        args: tc.function.arguments.clone(),
-                    });
+            let mut has_tool_calls = false;
+            let mut text_only = false;
 
-                    let tool_result = self.execute_tool_call(&tool_call).await;
-                    events.push(AgentEvent::ToolCallComplete {
-                        name: tool_call.function.name.clone(),
-                        output: tool_result.output.clone(),
-                        success: tool_result.success,
-                    });
+            if let Some(choice) = response.choices.first() {
+                if let Some(tc_list) = &choice.message.tool_calls {
+                    if tc_list.is_empty() {
+                        text_only = true;
+                    } else {
+                        for tc in tc_list {
+                            has_tool_calls = true;
+                            let tool_call = ToolCall {
+                                id: tc.id.clone(),
+                                call_type: tc.call_type.clone(),
+                                function: ToolFunction {
+                                    name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.clone(),
+                                },
+                            };
 
-                    // If tool was denied (not just failed), signal early exit with tool info
-                    if tool_result.output.contains("was denied by user") {
-                        return Ok(Some((tc.function.name.clone(), tc.function.arguments.clone())));
+                            events.push(AgentEvent::ToolCallAboutToRun {
+                                name: tc.function.name.clone(),
+                                args: tc.function.arguments.clone(),
+                            });
+
+                            let tool_result = self.execute_tool_call(&tool_call).await;
+                            events.push(AgentEvent::ToolCallComplete {
+                                name: tool_call.function.name.clone(),
+                                output: tool_result.output.clone(),
+                                success: tool_result.success,
+                            });
+
+                            if tool_result.output.contains("was denied by user") {
+                                return Ok(Some((tc.function.name.clone(), tc.function.arguments.clone())));
+                            }
+
+                            self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
+                        }
                     }
-
-                    // Add to context for next iteration
-                    self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
                 }
             }
+
+            if has_tool_calls {
+                continue; // keep looping — LLM may have more tool calls
+            }
+
+            if text_only {
+                // LLM returned text without tool calls — add it and ask it to continue
+                if let Some(choice) = response.choices.first() {
+                    if let Some(text) = &choice.message.content {
+                        if !text.trim().is_empty() {
+                            messages.push(Message::assistant(text.clone(), None));
+                            self.context.add_message(Message::assistant(text.clone(), None));
+                            events.push(AgentEvent::TextChunk(text.clone()));
+                        }
+                    }
+                }
+                continue; // loop back — ask the LLM to actually act
+            }
+
+            // Shouldn't reach here, but break to avoid infinite loop
+            break;
         }
 
-        if has_tool_calls {
-            Ok(None)
-        } else {
-            Ok(None)
-        }
+        Ok(None)
     }
 
     async fn execute_tool_call(&self, tool_call: &ToolCall) -> ToolResult {
@@ -315,20 +341,81 @@ impl Agent {
             .collect::<Vec<_>>();
         messages.insert(0, Message::system(self.system_prompt.clone()));
 
-        let request = ChatRequest {
-            model: self.model_name.clone(),
-            messages,
-            tools: None,
-            tool_choice: None,
-        };
+        let mut accumulated_text = String::new();
+        let mut last_had_tool_calls = false;
 
-        let response = self.llm.chat(request).await?;
+        // Loop: check if the LLM suggests more tool calls before giving a final answer.
+        // If it returns text without tool calls and doesn't suggest more actions,
+        // return the text. Otherwise, execute any tool calls and continue.
+        for _ in 0..10 {
+            let request = ChatRequest {
+                model: self.model_name.clone(),
+                messages: messages.clone(),
+                tools: Some(self.registry.to_function_definitions()),
+                tool_choice: Some("auto".to_string()),
+            };
 
-        if let Some(choice) = response.choices.first() {
-            Ok(choice.message.content.clone().unwrap_or_default())
-        } else {
-            anyhow::bail!("No response from LLM")
+            let response = self.llm.chat(request).await?;
+
+            let mut has_tool_calls = false;
+            let mut text_only = false;
+
+            if let Some(choice) = response.choices.first() {
+                if let Some(tc_list) = &choice.message.tool_calls {
+                    if tc_list.is_empty() {
+                        text_only = true;
+                    } else {
+                        for tc in tc_list {
+                            has_tool_calls = true;
+                            let tool_call = ToolCall {
+                                id: tc.id.clone(),
+                                call_type: tc.call_type.clone(),
+                                function: ToolFunction {
+                                    name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.clone(),
+                                },
+                            };
+
+                            let tool_result = self.execute_tool_call(&tool_call).await;
+                            self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
+                        }
+                    }
+                }
+
+                if let Some(text) = &choice.message.content {
+                    if !text.trim().is_empty() {
+                        accumulated_text = text.clone();
+                    }
+                }
+            }
+
+            if has_tool_calls {
+                messages.push(Message::assistant(String::new(), None));
+                continue;
+            }
+
+            if text_only {
+                // LLM returned text without tool calls — check if it suggests more actions
+                if !accumulated_text.is_empty() {
+                    messages.push(Message::assistant(accumulated_text.clone(), None));
+                    // If we had tool calls in the previous iteration and now get text,
+                    // it might be a final answer. But check one more time.
+                    if last_had_tool_calls {
+                        // One more pass to see if the LLM wants to do more
+                        last_had_tool_calls = false;
+                        continue;
+                    }
+                    // No tool calls and text only — this is the final answer
+                    return Ok(accumulated_text);
+                }
+                last_had_tool_calls = false;
+                continue;
+            }
+
+            break;
         }
+
+        Ok(accumulated_text)
     }
 
     async fn fallback_answer(&mut self, _user_prompt: &str) -> AgentResult {
@@ -387,28 +474,90 @@ impl Agent {
             }
         }
 
-        // Get final answer after executing any tool calls
-        let final_messages = self
+        // Get final answer after executing any tool calls, checking for more actions
+        let mut final_messages = self
             .context
             .get_completion_messages()
             .into_iter()
             .filter_map(|m| m.to_api_message())
             .collect::<Vec<_>>();
-        let final_messages_len = final_messages.len();
-        let final_answer = match self.llm.chat(ChatRequest {
-            model: self.model_name.clone(),
-            messages: final_messages,
-            tools: None,
-            tool_choice: None,
-        }).await {
-            Ok(resp) => resp.choices.first().and_then(|c| c.message.content.clone()).unwrap_or_default(),
-            Err(_) => String::new(),
-        };
+        final_messages.insert(0, Message::system(self.system_prompt.clone()));
 
-        if !final_answer.is_empty() {
-            events.push(AgentEvent::Complete(final_answer));
-        } else if final_messages_len == 0 {
-            events.push(AgentEvent::Failed("No response from LLM".to_string()));
+        let mut accumulated_text = String::new();
+        let mut last_had_tool_calls = false;
+
+        for _ in 0..10 {
+            let request = ChatRequest {
+                model: self.model_name.clone(),
+                messages: final_messages.clone(),
+                tools: Some(self.registry.to_function_definitions()),
+                tool_choice: Some("auto".to_string()),
+            };
+
+            let response = match self.llm.chat(request).await {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            let mut has_tool_calls = false;
+            let mut text_only = false;
+
+            if let Some(choice) = response.choices.first() {
+                if let Some(tc_list) = &choice.message.tool_calls {
+                    if tc_list.is_empty() {
+                        text_only = true;
+                    } else {
+                        for tc in tc_list {
+                            has_tool_calls = true;
+                            events.push(AgentEvent::ToolCallAboutToRun {
+                                name: tc.function.name.clone(),
+                                args: tc.function.arguments.clone(),
+                            });
+                            let tool_call = ToolCall {
+                                id: tc.id.clone(),
+                                call_type: tc.call_type.clone(),
+                                function: ToolFunction {
+                                    name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.clone(),
+                                },
+                            };
+                            let tool_result = self.execute_tool_call(&tool_call).await;
+                            events.push(AgentEvent::ToolCallComplete {
+                                name: tool_call.function.name.clone(),
+                                output: tool_result.output.clone(),
+                                success: tool_result.success,
+                            });
+                            self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
+                        }
+                    }
+                }
+
+                if let Some(text) = &choice.message.content {
+                    if !text.trim().is_empty() {
+                        accumulated_text = text.clone();
+                    }
+                }
+            }
+
+            if has_tool_calls {
+                final_messages.push(Message::assistant(String::new(), None));
+                continue;
+            }
+
+            if text_only && !accumulated_text.is_empty() {
+                final_messages.push(Message::assistant(accumulated_text.clone(), None));
+                if last_had_tool_calls {
+                    last_had_tool_calls = false;
+                    continue;
+                }
+                break;
+            }
+
+            last_had_tool_calls = false;
+        }
+
+        if !accumulated_text.is_empty() {
+            events.push(AgentEvent::Complete(accumulated_text));
         }
 
         events
