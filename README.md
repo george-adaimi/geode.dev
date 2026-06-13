@@ -1,6 +1,10 @@
-# Geode
+<div align="center">
+  <img src="assets/geode_logo.png" alt="geode.dev logo" width="500"/>
+</div>
 
-A local AI agent framework that runs as a Rust CLI. Geode connects to a local LLM served via llama.cpp and acts as an autonomous agent — planning tasks, executing tool calls, and iteratively working through multi-step objectives.
+# <span style="color: lightblue">geode.dev</span>
+
+A local AI agent framework that runs as a Rust CLI. <span style="color: lightblue">geode.dev</span> connects to a local LLM served via llama.cpp and acts as an autonomous agent — planning tasks, executing tool calls, and iteratively working through multi-step objectives.
 
 ## Features
 
@@ -54,7 +58,7 @@ Edit `server_url` to point to your LLM server and set `model_path` to the model 
 
 ### 2. Install a model (optional)
 
-Geode ships with a built-in model registry. To install a model:
+<span style="color: lightblue">geode.dev</span> ships with a built-in model registry. To install a model:
 
 ```bash
 geode model install llama3.1-8b
