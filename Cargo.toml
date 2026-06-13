@@ -1,0 +1,3 @@
+[workspace]
+members = ["geode-core", "geode-tools", "geode-cli"]
+resolver = "2"
