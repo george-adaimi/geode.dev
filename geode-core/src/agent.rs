@@ -1,10 +1,12 @@
 use crate::context::ContextManager;
-use crate::llm_client::{ChatRequest, LlmClient};
+use crate::llm_client::{ChatChoice, ChatMessage, ChatRequest, ChatResponse, LlmClient, ParsedFunction, ParsedToolCall};
 use crate::message::{Message, ToolCall, ToolFunction};
 use crate::planning::{Plan, PlanStep};
 use crate::tool::{SafetyLevel, ToolResult};
 use crate::tool_registry::ToolRegistry;
 use anyhow::Result;
+use futures::StreamExt;
+use tokio::sync::mpsc::Sender;
 
 pub struct Agent {
     llm: LlmClient,
@@ -26,6 +28,13 @@ pub enum AgentEvent {
     Failed(String),
 }
 
+/// Outcome returned from `execute_step` to replace event-buffer reads.
+#[derive(Debug, Default)]
+pub struct StepOutcome {
+    pub denied: Option<(String, String)>,
+    pub had_tool_calls: bool,
+}
+
 pub type AgentResult = Vec<AgentEvent>;
 
 impl Agent {
@@ -43,9 +52,7 @@ impl Agent {
         }
     }
 
-    pub async fn run(&mut self, user_prompt: &str) -> AgentResult {
-        let mut events = Vec::new();
-
+    pub async fn run(&mut self, user_prompt: &str, tx: &Sender<AgentEvent>) -> Result<()> {
         self.context.add_message(Message::user(user_prompt));
 
         // Generate initial plan
@@ -54,15 +61,15 @@ impl Agent {
                 Ok(p) => p,
                 Err(_) => {
                     // Plan generation failed — fall back to direct LLM call with tools
-                    return self.fallback_answer(user_prompt).await;
+                    return self.fallback_answer(user_prompt, tx).await;
                 }
             },
             Err(e) => {
-                events.push(AgentEvent::Failed(format!("Failed to build context: {}", e)));
-                return events;
+                let _ = tx.send(AgentEvent::Failed(format!("Failed to build context: {}", e))).await;
+                return Ok(());
             }
         };
-        events.push(AgentEvent::PlanGenerated(plan.clone()));
+        let _ = tx.send(AgentEvent::PlanGenerated(plan.clone())).await;
 
         let mut current_plan = plan;
         for _round in 0..10 {
@@ -71,18 +78,18 @@ impl Agent {
             }
 
             if current_plan.any_failed() {
-                events.push(AgentEvent::TextChunk("Replanning due to failed step...\n".to_string()));
+                let _ = tx.send(AgentEvent::TextChunk("Replanning due to failed step...\n".to_string())).await;
                 current_plan = match self.build_messages_for_plan() {
                     Ok(msgs) => match self.send_to_llm_for_plan(&msgs).await {
                         Ok(p) => p,
                         Err(e) => {
-                            events.push(AgentEvent::Failed(format!("Failed to replan: {}", e)));
-                            return events;
+                            let _ = tx.send(AgentEvent::Failed(format!("Failed to replan: {}", e))).await;
+                            return Ok(());
                         }
                     },
                     Err(e) => {
-                        events.push(AgentEvent::Failed(format!("Failed to build context: {}", e)));
-                        return events;
+                        let _ = tx.send(AgentEvent::Failed(format!("Failed to build context: {}", e))).await;
+                        return Ok(());
                     }
                 };
                 continue;
@@ -95,48 +102,35 @@ impl Agent {
 
             current_plan.set_step_running(step_idx);
             let step_desc = current_plan.steps[step_idx].description.clone();
-            events.push(AgentEvent::TextChunk(format!("[Step {}] {}\n", step_idx + 1, step_desc)));
+            let _ = tx.send(AgentEvent::TextChunk(format!("[Step {}] {}\n", step_idx + 1, step_desc))).await;
 
             let step = current_plan.steps[step_idx].clone();
-            let result = self.execute_step(&step, &mut events).await;
-            match result {
-                Ok(Some((name, args))) => {
-                    // Tool call was denied by user
-                    events.push(AgentEvent::ApprovalDenied { name, args });
-                    return events;
-                }
-                Ok(None) => {
-                    // Normal completion (with or without tool calls)
-                    // Check if the last ToolCallComplete was a denial
-                    if let Some(AgentEvent::ToolCallComplete { output, .. }) = events.last() {
-                        if output.contains("was denied by user") {
-                            // Shouldn't happen since we return early, but handle it
-                            continue;
+            let outcome = self.execute_step(&step, tx).await;
+            match outcome {
+                Ok(outcome) => match outcome.denied {
+                    Some((name, args)) => {
+                        let _ = tx.send(AgentEvent::ApprovalDenied { name, args }).await;
+                        return Ok(());
+                    }
+                    None => {
+                        if !outcome.had_tool_calls {
+                            current_plan.set_step_complete(step_idx, "Completed via text response");
                         }
                     }
-                    // If no tool calls were made, mark complete
-                    let had_tool_calls = events.iter().any(|e| matches!(e, AgentEvent::ToolCallAboutToRun { .. }));
-                    if !had_tool_calls {
-                        current_plan.set_step_complete(step_idx, "Completed via text response");
-                    }
-                }
+                },
                 Err(e) => {
+                    let _ = tx.send(AgentEvent::TextChunk(format!("Step failed: {}\n", e))).await;
                     current_plan.set_step_failed(step_idx, e.to_string());
-                    events.push(AgentEvent::TextChunk(format!("Step failed: {}\n", e)));
                 }
             }
         }
 
-        // Final answer
-        self.context.add_message(Message::user(
-            "All steps complete. Please provide a final answer summarizing what was done.",
-        ));
-        match self.get_final_answer().await {
-            Ok(answer) => events.push(AgentEvent::Complete(answer)),
-            Err(e) => events.push(AgentEvent::Failed(format!("Failed to get final answer: {}", e))),
+        // Streaming final answer — synthesizes step work into one response.
+        if let Err(e) = self.get_final_answer(tx).await {
+            let _ = tx.send(AgentEvent::Failed(format!("Failed to get final answer: {}", e))).await;
         }
-
-        events
+        let _ = tx.send(AgentEvent::Complete(String::new())).await;
+        Ok(())
     }
 
     fn build_messages_for_plan(&self) -> Result<Vec<Message>> {
@@ -149,12 +143,24 @@ impl Agent {
         Ok(messages)
     }
 
+    /// Build all messages from context for an LLM call (step execution, final answer, etc.).
+    fn build_messages_for_llm(&self) -> Vec<Message> {
+        let mut messages = self.context.get_completion_messages();
+        messages = messages
+            .into_iter()
+            .filter_map(|m| m.to_api_message())
+            .collect();
+        messages.insert(0, Message::system(self.system_prompt.clone()));
+        messages
+    }
+
     async fn send_to_llm_for_plan(&self, messages: &[Message]) -> Result<Plan> {
         let request = ChatRequest {
             model: self.model_name.clone(),
             messages: messages.to_vec(),
             tools: None,
             tool_choice: None,
+            stream: false,
         };
 
         let response = self.llm.chat(request).await?;
@@ -203,40 +209,110 @@ impl Agent {
         anyhow::bail!("Failed to parse plan from text")
     }
 
+    /// Send a streaming LLM request, emitting TextChunk events as text arrives.
+    /// Returns the complete ChatResponse (same contract as a non-streaming call).
+    async fn chat_streaming(
+        &self,
+        mut request: ChatRequest,
+        tx: &Sender<AgentEvent>,
+    ) -> Result<ChatResponse> {
+        request.stream = true;
+        let mut stream = self.llm.chat_stream(request).await?;
+
+        let mut full_content = String::new();
+        let mut tool_calls: Vec<Option<ParsedToolCall>> = Vec::new();
+
+        while let Some(chunks) = stream.next().await {
+            let chunks = chunks?;
+            for chunk in chunks {
+                for choice in chunk.choices {
+                    if let Some(content) = choice.delta.content {
+                        if !content.is_empty() {
+                            full_content.push_str(&content);
+                            let _ = tx.send(AgentEvent::TextChunk(content)).await;
+                        }
+                    }
+
+                    if let Some(tc_list) = choice.delta.tool_calls {
+                        for tc in tc_list {
+                            let index = tc.index;
+                            while tool_calls.len() <= index {
+                                tool_calls.push(None);
+                            }
+                            let entry = tool_calls[index].get_or_insert_with(|| ParsedToolCall {
+                                id: String::new(),
+                                call_type: "function".to_string(),
+                                function: ParsedFunction {
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                },
+                            });
+                            if let Some(id) = tc.id {
+                                entry.id = id;
+                            }
+                            if let Some(ct) = tc.call_type {
+                                entry.call_type = ct;
+                            }
+                            if let Some(name) = tc.function.as_ref().and_then(|f| f.name.clone()) {
+                                entry.function.name = name;
+                            }
+                            if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.clone()) {
+                                entry.function.arguments.push_str(&args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_tool_calls: Option<Vec<ParsedToolCall>> = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls.into_iter().filter_map(|t| t).collect())
+        };
+
+        Ok(ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: if full_content.is_empty() { None } else { Some(full_content) },
+                    tool_calls: final_tool_calls,
+                },
+            }],
+        })
+    }
+
     async fn execute_step(
         &mut self,
         step: &PlanStep,
-        events: &mut Vec<AgentEvent>,
-    ) -> Result<Option<(String, String)>> {
-        let prompt = format!(
+        tx: &Sender<AgentEvent>,
+    ) -> Result<StepOutcome> {
+        self.context.add_message(Message::user(format!(
             "Execute this step: '{}'. Use the appropriate tool.",
             step.description
-        );
+        )));
 
-        let mut messages = vec![Message::system(self.system_prompt.clone())];
-        messages.push(Message::user(prompt));
+        let mut outcome = StepOutcome::default();
 
-        // Loop: if the LLM returns text without tool calls, ask it to continue
-        // with actual tool executions rather than just describing what it would do.
-        for _loop_iter in 0..10 {
+        // Non-streaming loop — just show tool calls, no text output yet.
+        for _ in 0..10 {
+            let messages = self.build_messages_for_llm();
+
             let request = ChatRequest {
                 model: self.model_name.clone(),
-                messages: messages.clone(),
+                messages,
                 tools: Some(self.registry.to_function_definitions()),
                 tool_choice: Some("auto".to_string()),
+                stream: false,
             };
 
             let response = self.llm.chat(request).await?;
 
-            // Snapshot the choice so we can use it after the loop iteration.
-            // The response.choices is consumed in the match below, so we
-            // extract what we need up front.
             let choice = response.choices.first().cloned();
             let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
             let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
 
             if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
-                // Build assistant message with tool calls
                 let assistant_tool_calls: Vec<ToolCall> = tc_list
                     .iter()
                     .map(|tc| ToolCall {
@@ -249,19 +325,18 @@ impl Agent {
                     })
                     .collect();
 
-                // Add assistant message with tool calls to messages and context
-                let assistant_content = text_content.as_deref().unwrap_or("").to_string();
-                messages.push(Message::assistant(
-                    assistant_content.clone(),
-                    Some(assistant_tool_calls.clone()),
-                ));
                 self.context.add_message(Message::assistant(
-                    assistant_content,
+                    text_content.as_deref().unwrap_or("").to_string(),
                     Some(assistant_tool_calls),
                 ));
 
-                // Execute each tool call and add results
                 for tc in tc_list {
+                    outcome.had_tool_calls = true;
+                    let _ = tx.send(AgentEvent::ToolCallAboutToRun {
+                        name: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
+                    }).await;
+
                     let tool_call = ToolCall {
                         id: tc.id.clone(),
                         call_type: tc.call_type.clone(),
@@ -271,52 +346,51 @@ impl Agent {
                         },
                     };
 
-                    events.push(AgentEvent::ToolCallAboutToRun {
-                        name: tc.function.name.clone(),
-                        args: tc.function.arguments.clone(),
-                    });
-
                     let tool_result = self.execute_tool_call(&tool_call).await;
-                    events.push(AgentEvent::ToolCallComplete {
+                    let _ = tx.send(AgentEvent::ToolCallComplete {
                         name: tool_call.function.name.clone(),
                         output: tool_result.output.clone(),
                         success: tool_result.success,
-                    });
+                    }).await;
 
                     if tool_result.output.contains("was denied by user") {
-                        return Ok(Some((tc.function.name.clone(), tc.function.arguments.clone())));
+                        outcome.denied = Some((tc.function.name.clone(), tc.function.arguments.clone()));
+                        return Ok(outcome);
                     }
 
-                    // Add tool result to both messages and context
-                    let result_msg = Message::tool_result(&tc.id, &tool_result.output);
-                    messages.push(result_msg.clone());
-                    self.context.add_message(result_msg);
+                    self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
                 }
 
-                continue; // keep looping — LLM may have more tool calls
+                continue;
             }
 
-            // No tool calls — LLM returned text only
+            // No tool calls — add text to context for final answer synthesis, then break.
             if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
-                messages.push(Message::assistant(text.clone(), None));
                 self.context.add_message(Message::assistant(text.clone(), None));
-                events.push(AgentEvent::TextChunk(text.clone()));
-                continue; // loop back — ask the LLM to continue
             }
-
             break;
         }
 
-        Ok(None)
+        Ok(outcome)
     }
 
     async fn execute_tool_call(&self, tool_call: &ToolCall) -> ToolResult {
         let tool_name = &tool_call.function.name;
         let args = &tool_call.function.arguments;
 
-        // Check safety level — ask for approval if needed
+        let parsed_args: serde_json::Value = match serde_json::from_str(args) {
+            Ok(v) => v,
+            Err(e) => {
+                return ToolResult::err(
+                    "",
+                    format!("Failed to parse tool arguments: {}", e),
+                );
+            }
+        };
+
+        // Check dynamic safety level based on args — ask for approval if needed
         if let Some(tool) = self.registry.get(tool_name) {
-            match tool.safety_level() {
+            match tool.args_safety_level(&parsed_args) {
                 SafetyLevel::Safe => {}
                 SafetyLevel::Warning | SafetyLevel::Dangerous => {
                     if let Some(on_approve) = &self.on_approve {
@@ -332,148 +406,58 @@ impl Agent {
             }
         }
 
-        let parsed_args: serde_json::Value = match serde_json::from_str(args) {
-            Ok(v) => v,
-            Err(e) => {
-                return ToolResult::err(
-                    "",
-                    format!("Failed to parse tool arguments: {}", e),
-                );
-            }
-        };
-
         match self.registry.get(tool_name) {
             Some(tool) => tool.execute(parsed_args).await,
             None => ToolResult::err("", format!("Unknown tool: {}", tool_name)),
         }
     }
 
-    async fn get_final_answer(&mut self) -> Result<String> {
-        let mut messages = self
-            .context
-            .get_completion_messages()
-            .into_iter()
-            .filter_map(|m| m.to_api_message())
-            .collect::<Vec<_>>();
-        messages.insert(0, Message::system(self.system_prompt.clone()));
+    /// Streaming final answer after all steps complete.
+    async fn get_final_answer(&mut self, tx: &Sender<AgentEvent>) -> Result<()> {
+        self.context.add_message(Message::user(
+            "All steps are complete. Synthesize a final answer for the user based on what was done.",
+        ));
 
-        let mut accumulated_text = String::new();
-        let mut last_had_tool_calls = false;
-
-        // Loop: check if the LLM suggests more tool calls before giving a final answer.
-        // If it returns text without tool calls and doesn't suggest more actions,
-        // return the text. Otherwise, execute any tool calls and continue.
-        for _ in 0..10 {
-            let request = ChatRequest {
-                model: self.model_name.clone(),
-                messages: messages.clone(),
-                tools: Some(self.registry.to_function_definitions()),
-                tool_choice: Some("auto".to_string()),
-            };
-
-            let response = self.llm.chat(request).await?;
-
-            let choice = response.choices.first().cloned();
-            let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
-            let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
-
-            if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
-                accumulated_text = text.clone();
-            }
-
-            if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
-                last_had_tool_calls = true;
-
-                let assistant_tool_calls: Vec<ToolCall> = tc_list
-                    .iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id.clone(),
-                        call_type: tc.call_type.clone(),
-                        function: ToolFunction {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                    })
-                    .collect();
-
-                let assistant_content = text_content.unwrap_or_default();
-                messages.push(Message::assistant(
-                    assistant_content.clone(),
-                    Some(assistant_tool_calls.clone()),
-                ));
-                self.context.add_message(Message::assistant(
-                    assistant_content,
-                    Some(assistant_tool_calls),
-                ));
-
-                for tc in tc_list {
-                    let tool_call = ToolCall {
-                        id: tc.id.clone(),
-                        call_type: tc.call_type.clone(),
-                        function: ToolFunction {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                    };
-                    let tool_result = self.execute_tool_call(&tool_call).await;
-                    let result_msg = Message::tool_result(&tc.id, &tool_result.output);
-                    messages.push(result_msg.clone());
-                    self.context.add_message(result_msg);
-                }
-                continue;
-            }
-
-            // No tool calls — text only
-            if !accumulated_text.is_empty() {
-                messages.push(Message::assistant(accumulated_text.clone(), None));
-                if last_had_tool_calls {
-                    last_had_tool_calls = false;
-                    continue;
-                }
-                return Ok(accumulated_text);
-            }
-
-            last_had_tool_calls = false;
-        }
-
-        Ok(accumulated_text)
-    }
-
-    async fn fallback_answer(&mut self, _user_prompt: &str) -> AgentResult {
-        let mut events = Vec::new();
-        let mut messages = self
-            .context
-            .get_completion_messages()
-            .into_iter()
-            .filter_map(|m| m.to_api_message())
-            .collect::<Vec<_>>();
-        messages.insert(0, Message::system(self.system_prompt.clone()));
+        let messages = self.build_messages_for_llm();
 
         let request = ChatRequest {
             model: self.model_name.clone(),
-            messages: messages.clone(),
+            messages,
             tools: Some(self.registry.to_function_definitions()),
             tool_choice: Some("auto".to_string()),
+            stream: false,
         };
 
-        let response = match self.llm.chat(request).await {
+        self.chat_streaming(request, tx).await?;
+        Ok(())
+    }
+
+    async fn fallback_answer(&mut self, _user_prompt: &str, tx: &Sender<AgentEvent>) -> Result<()> {
+        // Initial LLM call with tools enabled — use streaming so tokens appear incrementally
+        let initial_messages = self.build_messages_for_llm();
+
+        let request = ChatRequest {
+            model: self.model_name.clone(),
+            messages: initial_messages,
+            tools: Some(self.registry.to_function_definitions()),
+            tool_choice: Some("auto".to_string()),
+            stream: false,
+        };
+
+        let response = match self.chat_streaming(request, tx).await {
             Ok(r) => r,
             Err(e) => {
-                events.push(AgentEvent::Failed(format!("LLM error: {}", e)));
-                return events;
+                let _ = tx.send(AgentEvent::Failed(format!("LLM error: {}", e))).await;
+                return Ok(());
             }
         };
 
-        // Process initial response — add assistant + tool results to messages
         let choice = response.choices.first().cloned();
         let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
         let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
 
-        if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
-            events.push(AgentEvent::TextChunk(text.clone()));
-        }
-
         if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
+            // LLM made tool calls — save to context, execute them, then loop for final answer
             let assistant_tool_calls: Vec<ToolCall> = tc_list
                 .iter()
                 .map(|tc| ToolCall {
@@ -486,20 +470,16 @@ impl Agent {
                 })
                 .collect();
 
-            messages.push(Message::assistant(
-                text_content.unwrap_or_default(),
-                Some(assistant_tool_calls.clone()),
-            ));
             self.context.add_message(Message::assistant(
-                String::new(),
+                text_content.unwrap_or_default(),
                 Some(assistant_tool_calls),
             ));
 
             for tc in tc_list {
-                events.push(AgentEvent::ToolCallAboutToRun {
+                let _ = tx.send(AgentEvent::ToolCallAboutToRun {
                     name: tc.function.name.clone(),
                     args: tc.function.arguments.clone(),
-                });
+                }).await;
                 let tool_call = ToolCall {
                     id: tc.id.clone(),
                     call_type: tc.call_type.clone(),
@@ -509,119 +489,102 @@ impl Agent {
                     },
                 };
                 let tool_result = self.execute_tool_call(&tool_call).await;
-                events.push(AgentEvent::ToolCallComplete {
+                let _ = tx.send(AgentEvent::ToolCallComplete {
                     name: tool_call.function.name.clone(),
                     output: tool_result.output.clone(),
                     success: tool_result.success,
-                });
-                let result_msg = Message::tool_result(&tc.id, &tool_result.output);
-                messages.push(result_msg.clone());
-                self.context.add_message(result_msg);
-            }
-        }
-
-        // Final answer loop with tools enabled
-        let mut final_messages = messages.clone();
-        final_messages.insert(0, Message::system(self.system_prompt.clone()));
-
-        let mut accumulated_text = String::new();
-        let mut last_had_tool_calls = false;
-
-        for _ in 0..10 {
-            let request = ChatRequest {
-                model: self.model_name.clone(),
-                messages: final_messages.clone(),
-                tools: Some(self.registry.to_function_definitions()),
-                tool_choice: Some("auto".to_string()),
-            };
-
-            let response = match self.llm.chat(request).await {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-
-            let choice = response.choices.first().cloned();
-            let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
-            let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
-
-            if let Some(text) = text_content.as_ref().filter(|t| !t.trim().is_empty()) {
-                accumulated_text = text.clone();
+                }).await;
+                self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
             }
 
-            if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
-                last_had_tool_calls = true;
+            // Loop to let the LLM make more tool calls or produce a final answer
+            let mut last_had_tool_calls = false;
 
-                let assistant_tool_calls: Vec<ToolCall> = tc_list
-                    .iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id.clone(),
-                        call_type: tc.call_type.clone(),
-                        function: ToolFunction {
+            for _ in 0..10 {
+                let messages = self.build_messages_for_llm();
+
+                let request = ChatRequest {
+                    model: self.model_name.clone(),
+                    messages,
+                    tools: Some(self.registry.to_function_definitions()),
+                    tool_choice: Some("auto".to_string()),
+                    stream: false,
+                };
+
+                let response = match self.chat_streaming(request, tx).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+
+                let choice = response.choices.first().cloned();
+                let tc_list = choice.as_ref().and_then(|c| c.message.tool_calls.clone());
+                let text_content = choice.as_ref().and_then(|c| c.message.content.clone());
+
+                if let Some(tc_list) = tc_list.as_ref().filter(|l| !l.is_empty()) {
+                    last_had_tool_calls = true;
+
+                    let assistant_tool_calls: Vec<ToolCall> = tc_list
+                        .iter()
+                        .map(|tc| ToolCall {
+                            id: tc.id.clone(),
+                            call_type: tc.call_type.clone(),
+                            function: ToolFunction {
+                                name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            },
+                        })
+                        .collect();
+
+                    self.context.add_message(Message::assistant(
+                        text_content.unwrap_or_default(),
+                        Some(assistant_tool_calls),
+                    ));
+
+                    for tc in tc_list {
+                        let _ = tx.send(AgentEvent::ToolCallAboutToRun {
                             name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                    })
-                    .collect();
-
-                final_messages.push(Message::assistant(
-                    text_content.unwrap_or_default(),
-                    Some(assistant_tool_calls.clone()),
-                ));
-                self.context.add_message(Message::assistant(
-                    String::new(),
-                    Some(assistant_tool_calls),
-                ));
-
-                for tc in tc_list {
-                    events.push(AgentEvent::ToolCallAboutToRun {
-                        name: tc.function.name.clone(),
-                        args: tc.function.arguments.clone(),
-                    });
-                    let tool_call = ToolCall {
-                        id: tc.id.clone(),
-                        call_type: tc.call_type.clone(),
-                        function: ToolFunction {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                    };
-                    let tool_result = self.execute_tool_call(&tool_call).await;
-                    events.push(AgentEvent::ToolCallComplete {
-                        name: tool_call.function.name.clone(),
-                        output: tool_result.output.clone(),
-                        success: tool_result.success,
-                    });
-                    let result_msg = Message::tool_result(&tc.id, &tool_result.output);
-                    final_messages.push(result_msg.clone());
-                    self.context.add_message(result_msg);
-                }
-                continue;
-            }
-
-            // No tool calls — text only
-            if !accumulated_text.is_empty() {
-                final_messages.push(Message::assistant(accumulated_text.clone(), None));
-                if last_had_tool_calls {
-                    last_had_tool_calls = false;
+                            args: tc.function.arguments.clone(),
+                        }).await;
+                        let tool_call = ToolCall {
+                            id: tc.id.clone(),
+                            call_type: tc.call_type.clone(),
+                            function: ToolFunction {
+                                name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            },
+                        };
+                        let tool_result = self.execute_tool_call(&tool_call).await;
+                        let _ = tx.send(AgentEvent::ToolCallComplete {
+                            name: tool_call.function.name.clone(),
+                            output: tool_result.output.clone(),
+                            success: tool_result.success,
+                        }).await;
+                        self.context.add_message(Message::tool_result(&tc.id, &tool_result.output));
+                    }
                     continue;
                 }
-                break;
+
+                // No tool calls — if we have text content, break (text was already streamed)
+                if text_content.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false) {
+                    if last_had_tool_calls {
+                        last_had_tool_calls = false;
+                        continue;
+                    }
+                    break;
+                }
+
+                last_had_tool_calls = false;
             }
-
-            last_had_tool_calls = false;
+        } else if text_content.as_ref().filter(|t| !t.trim().is_empty()).is_some() {
+            // No tool calls — LLM directly answered. Text was already streamed via chat_streaming.
         }
 
-        if !accumulated_text.is_empty() {
-            events.push(AgentEvent::Complete(accumulated_text));
-        }
-
-        events
+        Ok(())
     }
 
     /// Accept user input after a tool call was denied.
     /// Returns events continuing execution from the user's input.
-    pub async fn on_user_input(&mut self, input: &str) -> AgentResult {
-        let mut events = Vec::new();
+    pub async fn on_user_input(&mut self, input: &str, tx: &Sender<AgentEvent>) -> Result<()> {
         self.context.add_message(Message::user(input));
 
         // Try to generate a new plan from the user's input
@@ -630,17 +593,15 @@ impl Agent {
                 Ok(p) => p,
                 Err(_) => {
                     // Plan failed, fall back to direct answer
-                    return match self.get_final_answer().await {
-                        Ok(answer) => vec![AgentEvent::Complete(answer)],
-                        Err(e) => vec![AgentEvent::Failed(format!("Failed to get answer: {}", e))],
-                    };
+                    return self.fallback_answer(input, tx).await;
                 }
             },
             Err(e) => {
-                return vec![AgentEvent::Failed(format!("Failed to build context: {}", e))];
+                let _ = tx.send(AgentEvent::Failed(format!("Failed to build context: {}", e))).await;
+                return Ok(());
             }
         };
-        events.push(AgentEvent::PlanGenerated(plan.clone()));
+        let _ = tx.send(AgentEvent::PlanGenerated(plan.clone())).await;
 
         let mut current_plan = plan;
         for _round in 0..10 {
@@ -649,18 +610,18 @@ impl Agent {
             }
 
             if current_plan.any_failed() {
-                events.push(AgentEvent::TextChunk("Replanning due to failed step...\n".to_string()));
+                let _ = tx.send(AgentEvent::TextChunk("Replanning due to failed step...\n".to_string())).await;
                 current_plan = match self.build_messages_for_plan() {
                     Ok(msgs) => match self.send_to_llm_for_plan(&msgs).await {
                         Ok(p) => p,
                         Err(e) => {
-                            events.push(AgentEvent::Failed(format!("Failed to replan: {}", e)));
-                            return events;
+                            let _ = tx.send(AgentEvent::Failed(format!("Failed to replan: {}", e))).await;
+                            return Ok(());
                         }
                     },
                     Err(e) => {
-                        events.push(AgentEvent::Failed(format!("Failed to build context: {}", e)));
-                        return events;
+                        let _ = tx.send(AgentEvent::Failed(format!("Failed to build context: {}", e))).await;
+                        return Ok(());
                     }
                 };
                 continue;
@@ -673,37 +634,34 @@ impl Agent {
 
             current_plan.set_step_running(step_idx);
             let step_desc = current_plan.steps[step_idx].description.clone();
-            events.push(AgentEvent::TextChunk(format!("[Step {}] {}\n", step_idx + 1, step_desc)));
+            let _ = tx.send(AgentEvent::TextChunk(format!("[Step {}] {}\n", step_idx + 1, step_desc))).await;
 
             let step = current_plan.steps[step_idx].clone();
-            let result = self.execute_step(&step, &mut events).await;
-            match result {
-                Ok(Some((name, args))) => {
-                    events.push(AgentEvent::ApprovalDenied { name, args });
-                    return events;
-                }
-                Ok(None) => {
-                    let had_tool_calls = events.iter().any(|e| matches!(e, AgentEvent::ToolCallAboutToRun { .. }));
-                    if !had_tool_calls {
-                        current_plan.set_step_complete(step_idx, "Completed via text response");
+            let outcome = self.execute_step(&step, tx).await;
+            match outcome {
+                Ok(outcome) => match outcome.denied {
+                    Some((name, args)) => {
+                        let _ = tx.send(AgentEvent::ApprovalDenied { name, args }).await;
+                        return Ok(());
                     }
-                }
+                    None => {
+                        if !outcome.had_tool_calls {
+                            current_plan.set_step_complete(step_idx, "Completed via text response");
+                        }
+                    }
+                },
                 Err(e) => {
+                    let _ = tx.send(AgentEvent::TextChunk(format!("Step failed: {}\n", e))).await;
                     current_plan.set_step_failed(step_idx, e.to_string());
-                    events.push(AgentEvent::TextChunk(format!("Step failed: {}\n", e)));
                 }
             }
         }
 
-        // Final answer
-        self.context.add_message(Message::user(
-            "All steps complete. Please provide a final answer summarizing what was done.",
-        ));
-        match self.get_final_answer().await {
-            Ok(answer) => events.push(AgentEvent::Complete(answer)),
-            Err(e) => events.push(AgentEvent::Failed(format!("Failed to get final answer: {}", e))),
+        // Streaming final answer — synthesizes step work into one response.
+        if let Err(e) = self.get_final_answer(tx).await {
+            let _ = tx.send(AgentEvent::Failed(format!("Failed to get final answer: {}", e))).await;
         }
-
-        events
+        let _ = tx.send(AgentEvent::Complete(String::new())).await;
+        Ok(())
     }
 }

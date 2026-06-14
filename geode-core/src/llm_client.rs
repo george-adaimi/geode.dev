@@ -18,6 +18,8 @@ pub struct ChatRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,10 +143,12 @@ impl LlmClient {
     }
 
     /// Streaming chat completion — returns an async stream of chunks.
+    /// Uses a line buffer so SSE data split across HTTP chunks is handled correctly.
+    /// Each stream item yields all parsed chunks from the current buffer.
     pub async fn chat_stream(
         &self,
         request: ChatRequest,
-    ) -> reqwest::Result<impl futures::Stream<Item = reqwest::Result<StreamChunk>>> {
+    ) -> reqwest::Result<impl futures::Stream<Item = reqwest::Result<Vec<StreamChunk>>>> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let res = self
             .client
@@ -154,22 +158,36 @@ impl LlmClient {
             .send()
             .await?;
 
-        Ok(res.bytes_stream().map(|chunk| {
-            chunk.map(|bytes| {
-                let text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-                // Return first chunk if any parsed, otherwise empty
-                let chunks = parse_stream_chunks(&text);
-                if chunks.is_empty() {
-                    StreamChunk { choices: vec![] }
-                } else {
-                    chunks.into_iter().next().unwrap_or_default()
+        let mut buf = String::new();
+        Ok(res.bytes_stream().filter_map(move |chunk| {
+            let result: reqwest::Result<Vec<StreamChunk>> = chunk.map(|bytes| {
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                let mut ready = Vec::new();
+                while let Some(nl) = buf.find('\n') {
+                    let line = buf[..nl].trim_end_matches('\r').to_string();
+                    buf = buf[nl + 1..].to_string();
+                    if line.starts_with("data: ") {
+                        let data = &line[6..];
+                        if data.trim() == "[DONE]" {
+                            break;
+                        }
+                        if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data.trim()) {
+                            ready.push(chunk);
+                        }
+                    }
                 }
-            })
+                ready
+            });
+            match result {
+                Ok(chunks) if chunks.is_empty() => futures::future::ready(None),
+                other => futures::future::ready(Some(other)),
+            }
         }))
     }
 }
 
-/// Parse SSE stream text into individual chunk events.
+/// Parse SSE stream text into individual chunk events (used in tests).
+#[cfg(test)]
 fn parse_stream_chunks(text: &str) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
     for line in text.lines() {

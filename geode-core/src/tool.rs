@@ -7,6 +7,13 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;
     fn safety_level(&self) -> SafetyLevel;
+
+    /// Dynamic safety level based on the actual tool arguments.
+    /// Defaults to the static safety_level().
+    fn args_safety_level(&self, _args: &serde_json::Value) -> SafetyLevel {
+        self.safety_level()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> ToolResult;
 }
 

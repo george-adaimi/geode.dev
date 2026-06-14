@@ -2,6 +2,8 @@ mod commands;
 mod repl;
 
 use clap::{Parser, Subcommand};
+use geode_core::{Agent, LlmClient};
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(name = "geode", about = "Local AI agent framework")]
@@ -80,30 +82,25 @@ async fn main() {
         let system_prompt = repl::build_system_prompt(&registry);
         let mut agent = Agent::new(llm, registry, system_prompt, None::<fn(&str, &str) -> bool>, &model_name);
 
-        let result = agent.run(prompt).await;
-        for event in result {
-            match event {
-                geode_core::AgentEvent::TextChunk(text) => print!("{}", text),
-                geode_core::AgentEvent::PlanGenerated(plan) => {
-                    println!("\n{}", plan.format_display());
-                }
-                geode_core::AgentEvent::ToolCallAboutToRun { name, args } => {
-                    println!("\n[Calling: {}({})]", name, repl::truncate(&args, 100));
-                }
-                geode_core::AgentEvent::ToolCallComplete { name, output, success } => {
-                    let status = if success { "OK" } else { "FAIL" };
-                    println!("[{}] {} → {}", status, name, repl::truncate(&output, 200));
-                }
-                geode_core::AgentEvent::ApprovalDenied { name, args } => {
-                    println!("\n[Denied: {}({})]", name, repl::truncate(&args, 100));
-                }
-                geode_core::AgentEvent::Complete(answer) => {
-                    println!("\n{}", answer);
-                }
-                geode_core::AgentEvent::Failed(err) => {
-                    eprintln!("\nError: {}", err);
-                }
+        let (tx, mut rx) = mpsc::channel(64);
+        let prompt = prompt.clone();
+        let driver = tokio::spawn(async move {
+            agent.run(&prompt, &tx).await
+        });
+        while let Some(event) = rx.recv().await {
+            repl::emit_event(&event);
+        }
+        let driver_result = driver.await;
+        match driver_result {
+            Ok(Err(e)) => {
+                eprintln!("Agent error: {}", e);
+                std::process::exit(1);
             }
+            Err(e) => {
+                eprintln!("Agent driver error: {}", e);
+                std::process::exit(1);
+            }
+            Ok(Ok(())) => {}
         }
     } else {
         // REPL mode — interactive approval
@@ -111,5 +108,3 @@ async fn main() {
         repl.run().await;
     }
 }
-
-use geode_core::{Agent, LlmClient};

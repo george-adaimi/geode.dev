@@ -30,15 +30,22 @@ impl ContextManager {
     }
 
     /// If token count exceeds summarize_threshold, compress oldest messages.
+    /// If token count exceeds context_window, keep compressing until under it.
     pub fn maybe_compress(&mut self) {
         let token_count = self.tokenizer.count_messages(&self.messages);
         if token_count > self.summarize_threshold {
             self.compress();
         }
+        // If still over the hard window limit, force more compression
+        let token_count = self.tokenizer.count_messages(&self.messages);
+        if token_count > self.context_window {
+            self.compress();
+        }
     }
 
-    fn compress(&mut self) {
-        // Find messages that can be summarized (non-summary messages)
+    /// Compress the oldest batch of compressible messages into a summary.
+    /// Returns true if anything was compressed.
+    fn compress(&mut self) -> bool {
         let compressible: Vec<usize> = self
             .messages
             .iter()
@@ -47,10 +54,9 @@ impl ContextManager {
             .map(|(i, _)| i)
             .collect();
 
-        // Compress the oldest messages (up to a batch of 5)
         let batch_size = 5.min(compressible.len());
         if batch_size == 0 {
-            return;
+            return false;
         }
 
         let to_compress: Vec<usize> = compressible[..batch_size].to_vec();
@@ -61,7 +67,6 @@ impl ContextManager {
 
         let summary = crate::summarizer::compress_messages(&compressed_content);
 
-        // Rebuild messages without the compressed ones
         let mut new_messages = Vec::new();
         for (i, msg) in self.messages.iter().enumerate() {
             if !to_compress.contains(&i) {
@@ -70,10 +75,10 @@ impl ContextManager {
         }
         self.messages = new_messages;
 
-        // Add summary as a system message
         if !summary.is_empty() {
             self.messages.push(Message::summary(&summary));
         }
+        true
     }
 
     /// Get current token count.

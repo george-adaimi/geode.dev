@@ -1,6 +1,39 @@
 use geode_core::{Agent, LlmClient, ToolRegistry};
 use geode_tools::{FsTool, ShellTool, WebTool};
+use geode_core::AgentEvent;
+use rustyline::error::ReadlineError;
 use std::io::Write;
+use rustyline::history::DefaultHistory;
+use rustyline::Editor;
+use tokio::sync::mpsc;
+
+pub fn emit_event(event: &AgentEvent) {
+    match event {
+        AgentEvent::TextChunk(text) => {
+            print!("{}", text);
+            let _ = std::io::stdout().flush();
+        }
+        AgentEvent::PlanGenerated(plan) => {
+            println!("\n{}", plan.format_display());
+        }
+        AgentEvent::ToolCallAboutToRun { name, args } => {
+            println!("\n[Calling: {}({})]", name, truncate(args, 100));
+        }
+        AgentEvent::ToolCallComplete { name, output, success } => {
+            let status = if *success { "OK" } else { "FAIL" };
+            println!("[{}] {} → {}", status, name, truncate(output, 200));
+        }
+        AgentEvent::ApprovalDenied { name, args } => {
+            println!("\n[Denied: {}({})]", name, truncate(args, 100));
+        }
+        AgentEvent::Complete(answer) => {
+            println!("\n{}", answer);
+        }
+        AgentEvent::Failed(err) => {
+            eprintln!("\nError: {}", err);
+        }
+    }
+}
 
 pub struct Repl {
     agent: Agent,
@@ -25,58 +58,55 @@ impl Repl {
         println!("Geode REPL (type 'exit' or 'quit' to quit)");
         println!();
 
-        let prompt_text = String::from("geode > ");
-        let mut history: Vec<String> = Vec::new();
+        let history_path = geode_core::config::config_dir().join("repl_history.txt");
+        let mut rl = match Editor::<(), DefaultHistory>::new() {
+            Ok(rl) => rl,
+            Err(e) => {
+                eprintln!("Failed to initialize REPL editor: {}", e);
+                return;
+            }
+        };
+        let _ = rl.load_history(&history_path);
 
         loop {
-            print!("{}", prompt_text);
-            std::io::stdout().flush().unwrap();
+            let readline = rl.readline("geode > ");
+            let line = match readline {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+                Err(e) => {
+                    eprintln!("Readline error: {}", e);
+                    break;
+                }
+            };
 
-            let mut line = String::new();
-            if std::io::stdin().read_line(&mut line).is_err() {
-                break;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
+            let trimmed = line.trim().to_string();
+            if trimmed.is_empty() {
                 continue;
             }
 
-            match line {
+            let _ = rl.add_history_entry(&trimmed);
+
+            match trimmed.as_str() {
                 "exit" | "quit" => break,
                 "clear" => {
                     println!("\x1b[2J\x1b[1;1H");
                     continue;
                 }
                 _ => {
-                    history.push(line.to_string());
-                    let result = self.agent.run(line).await;
-                    let mut denied = false;
-                    for event in result {
-                        match &event {
-                            geode_core::AgentEvent::TextChunk(text) => print!("{}", text),
-                            geode_core::AgentEvent::PlanGenerated(plan) => {
-                                println!("\n{}", plan.format_display());
-                            }
-                            geode_core::AgentEvent::ToolCallAboutToRun { name, args } => {
-                                println!("\n[Calling: {}({})]", name, truncate(&args, 100));
-                            }
-                            geode_core::AgentEvent::ToolCallComplete { name, output, success } => {
-                                let status = if *success { "OK" } else { "FAIL" };
-                                println!("[{}] {} → {}", status, name, truncate(output, 200));
-                            }
-                            geode_core::AgentEvent::ApprovalDenied { name, args } => {
-                                println!("\n[Denied: {}({})]", name, truncate(&args, 100));
-                                denied = true;
-                            }
-                            geode_core::AgentEvent::Complete(answer) => {
-                                println!("\n{}", answer);
-                            }
-                            geode_core::AgentEvent::Failed(err) => {
-                                eprintln!("\nError: {}", err);
-                            }
+                    let (tx, rx) = mpsc::channel(64);
+                    let printer = tokio::spawn(async move {
+                        let mut rx = rx;
+                        let mut events = Vec::new();
+                        while let Some(event) = rx.recv().await {
+                            emit_event(&event);
+                            events.push(event);
                         }
-                    }
+                        events
+                    });
+                    self.agent.run(&trimmed, &tx).await.unwrap();
+                    drop(tx);
+                    let events = printer.await.unwrap();
+                    let denied = events.iter().any(|e| matches!(e, AgentEvent::ApprovalDenied { .. }));
 
                     if denied {
                         print!("\nTool call was denied. What would you like to do instead? > ");
@@ -85,33 +115,21 @@ impl Repl {
                         if std::io::stdin().read_line(&mut input).is_err() {
                             break;
                         }
-                        let input = input.trim();
+                        let input = input.trim().to_string();
                         if !input.is_empty() {
-                            let result = self.agent.on_user_input(input).await;
-                            for event in result {
-                                match event {
-                                    geode_core::AgentEvent::TextChunk(text) => print!("{}", text),
-                                    geode_core::AgentEvent::PlanGenerated(plan) => {
-                                        println!("\n{}", plan.format_display());
-                                    }
-                                    geode_core::AgentEvent::ToolCallAboutToRun { name, args } => {
-                                        println!("\n[Calling: {}({})]", name, truncate(&args, 100));
-                                    }
-                                    geode_core::AgentEvent::ToolCallComplete { name, output, success } => {
-                                        let status = if success { "OK" } else { "FAIL" };
-                                        println!("[{}] {} → {}", status, name, truncate(&output, 200));
-                                    }
-                                    geode_core::AgentEvent::ApprovalDenied { name, args } => {
-                                        println!("\n[Denied: {}({})]", name, truncate(&args, 100));
-                                    }
-                                    geode_core::AgentEvent::Complete(answer) => {
-                                        println!("\n{}", answer);
-                                    }
-                                    geode_core::AgentEvent::Failed(err) => {
-                                        eprintln!("\nError: {}", err);
-                                    }
+                            let (tx, rx) = mpsc::channel(64);
+                            let printer = tokio::spawn(async move {
+                                let mut rx = rx;
+                                let mut events = Vec::new();
+                                while let Some(event) = rx.recv().await {
+                                    emit_event(&event);
+                                    events.push(event);
                                 }
-                            }
+                                events
+                            });
+                            self.agent.on_user_input(&input, &tx).await.unwrap();
+                            drop(tx);
+                            let _ = printer.await.unwrap();
                         }
                     }
 
@@ -119,6 +137,8 @@ impl Repl {
                 }
             }
         }
+
+        let _ = rl.save_history(&history_path);
     }
 }
 

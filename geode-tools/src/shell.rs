@@ -1,11 +1,13 @@
 use async_trait::async_trait;
-use geode_core::{SafetyLevel, Tool, ToolResult};
+use geode_core::{SafetyLevel, Tool, ToolResult, Tokenizer};
 
-pub struct ShellTool;
+pub struct ShellTool {
+    max_tokens: usize,
+}
 
 impl ShellTool {
     pub fn new() -> Self {
-        Self
+        Self { max_tokens: 1024 }
     }
 }
 
@@ -14,10 +16,6 @@ impl Default for ShellTool {
         Self::new()
     }
 }
-
-const MAX_OUTPUT_CHARS: usize = 4096;
-const TRUNCATE_HEAD: usize = 2048;
-const TRUNCATE_TAIL: usize = 2048;
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -47,6 +45,21 @@ impl Tool for ShellTool {
     }
 
     fn safety_level(&self) -> SafetyLevel {
+        SafetyLevel::Dangerous
+    }
+
+    fn args_safety_level(&self, args: &serde_json::Value) -> SafetyLevel {
+        if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
+            let safe_commands = [
+                "ls", "cat", "head", "tail", "echo", "pwd", "which",
+                "whoami", "env", "date", "uname", "find", "grep",
+                "wc", "sort", "diff", "file", "du", "df",
+            ];
+            let cmd_name = command.split_whitespace().next().unwrap_or("");
+            if safe_commands.contains(&cmd_name) {
+                return SafetyLevel::Safe;
+            }
+        }
         SafetyLevel::Dangerous
     }
 
@@ -86,7 +99,7 @@ impl Tool for ShellTool {
                     result.push_str(&format!("(stderr: {})", stderr.trim()));
                 }
 
-                let truncated = truncate_output(&result);
+                let truncated = truncate_output(&result, self.max_tokens);
                 let metadata = format!(
                     "[Exit code: {}]\n{}",
                     exit_code, truncated
@@ -98,16 +111,22 @@ impl Tool for ShellTool {
     }
 }
 
-fn truncate_output(output: &str) -> String {
-    if output.len() <= MAX_OUTPUT_CHARS {
+fn truncate_output(output: &str, max_tokens: usize) -> String {
+    let tok = Tokenizer::new();
+    let token_count = tok.count(output);
+    if token_count <= max_tokens {
         output.to_string()
     } else {
-        let head = &output[..TRUNCATE_HEAD.min(output.len())];
-        let remaining = output.len() - MAX_OUTPUT_CHARS;
-        let tail_start = output.len().saturating_sub(TRUNCATE_TAIL);
-        let tail = &output[tail_start..];
+        // Estimate character positions using token ratio
+        let ratio = max_tokens as f64 / token_count as f64;
+        let target_chars = (output.len() as f64 * ratio) as usize;
+        let head_len = (target_chars / 2).max(50);
+        let tail_len = (target_chars / 2).max(50);
+        let remaining = token_count - max_tokens;
+        let head = &output[..head_len.min(output.len())];
+        let tail = &output[output.len().saturating_sub(tail_len)..];
         format!(
-            "{}\n... [{} more characters not shown] ...\n{}",
+            "{}\n... [~{} more tokens not shown] ...\n{}",
             head, remaining, tail
         )
     }
@@ -120,22 +139,25 @@ mod tests {
     #[test]
     fn test_truncate_short_output() {
         let short = "hello world";
-        assert_eq!(truncate_output(short), short);
+        assert_eq!(truncate_output(short, 1024), short);
     }
 
     #[test]
     fn test_truncate_long_output() {
-        let long = "a".repeat(5000);
-        let truncated = truncate_output(&long);
+        // ~1250 tokens at 4 chars/token
+        let long = "a ".repeat(10000);
+        let truncated = truncate_output(&long, 1024);
         assert!(truncated.len() < long.len());
-        assert!(truncated.contains("more characters not shown"));
-        assert!(truncated.starts_with("aaaaa"));
-        assert!(truncated.ends_with("aaaaa"));
+        assert!(truncated.contains("more tokens not shown"));
+        assert!(truncated.starts_with("a "));
+        assert!(truncated.ends_with("a "));
     }
 
     #[test]
     fn test_truncate_exact_boundary() {
-        let exact = "a".repeat(MAX_OUTPUT_CHARS);
-        assert_eq!(truncate_output(&exact), exact);
+        // A string that's ~1000 tokens
+        let exact = "hello ".repeat(800);
+        let truncated = truncate_output(&exact, 2000);
+        assert_eq!(truncated, exact);
     }
 }
